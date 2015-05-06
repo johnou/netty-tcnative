@@ -25,7 +25,6 @@
 #include "apr_thread_mutex.h"
 #include "apr_atomic.h"
 #include "apr_poll.h"
-#include <stdint.h>
 #ifdef HAVE_OPENSSL
 #include "ssl_private.h"
 
@@ -1178,9 +1177,9 @@ TCN_IMPLEMENT_CALL(jint, SSL, getLastErrorNumber)(TCN_STDARGS) {
 }
 
 static void ssl_info_callback(const SSL *ssl, int where, int ret) {
-    uint16_t *handshakeCount = NULL;
+    int *handshakeCount = NULL;
     if (0 != (where & SSL_CB_HANDSHAKE_START)) {
-        handshakeCount = (uint16_t*) SSL_get_app_data3(ssl);
+        handshakeCount = (int*) SSL_get_app_data3(ssl);
         if (handshakeCount != NULL) {
             ++(*handshakeCount);
         }
@@ -1191,7 +1190,7 @@ TCN_IMPLEMENT_CALL(jlong /* SSL * */, SSL, newSSL)(TCN_STDARGS,
                                                    jlong ctx /* tcn_ssl_ctxt_t * */,
                                                    jboolean server) {
     tcn_ssl_ctxt_t *c = J2P(ctx, tcn_ssl_ctxt_t *);
-    uint16_t *handshakeCount = malloc(sizeof(uint16_t));
+    int *handshakeCount = malloc(sizeof(int));
     SSL *ssl;
 
     UNREFERENCED_STDARGS;
@@ -1319,7 +1318,7 @@ TCN_IMPLEMENT_CALL(void, SSL, freeSSL)(TCN_STDARGS,
                                        jlong ssl /* SSL * */) {
     UNREFERENCED_STDARGS;
 
-    uint16_t *handshakeCount = NULL;
+    int *handshakeCount = NULL;
     SSL *ssl_ = J2P(ssl, SSL *);
 
     handshakeCount = SSL_get_app_data3(ssl_);
@@ -1764,7 +1763,7 @@ TCN_IMPLEMENT_CALL(jbyteArray, SSL, getSessionId)(TCN_STDARGS, jlong ssl)
 
 TCN_IMPLEMENT_CALL(jint, SSL, getHandshakeCount)(TCN_STDARGS, jlong ssl)
 {
-    uint16_t *handshakeCount = NULL;
+    int *handshakeCount = NULL;
     SSL *ssl_ = J2P(ssl, SSL *);
     if (ssl_ == NULL) {
         tcn_ThrowException(e, "ssl is null");
