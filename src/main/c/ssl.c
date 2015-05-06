@@ -1316,14 +1316,15 @@ TCN_IMPLEMENT_CALL(void, SSL, setShutdown)(TCN_STDARGS,
 // Free the SSL * and its associated internal BIO
 TCN_IMPLEMENT_CALL(void, SSL, freeSSL)(TCN_STDARGS,
                                        jlong ssl /* SSL * */) {
-    UNREFERENCED_STDARGS;
-
     SSL *ssl_ = J2P(ssl, SSL *);
     int *handshakeCount = SSL_get_app_data3(ssl_);
+
+    UNREFERENCED_STDARGS;
+
     if (handshakeCount != NULL) {
         free(handshakeCount);
     }
-    SSL_free(ssl);
+    SSL_free(ssl_);
 }
 
 // Make a BIO pair (network and internal) for the provided SSL * and return the network BIO
