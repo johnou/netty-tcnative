@@ -1318,7 +1318,7 @@ TCN_IMPLEMENT_CALL(void, SSL, freeSSL)(TCN_STDARGS,
                                        jlong ssl /* SSL * */) {
     UNREFERENCED_STDARGS;
 
-    int *handshakeCount = NULL;
+    int *handshakeCount;
     SSL *ssl_ = J2P(ssl, SSL *);
 
     handshakeCount = SSL_get_app_data3(ssl_);
