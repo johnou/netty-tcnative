@@ -25,7 +25,7 @@
 #include "apr_thread_mutex.h"
 #include "apr_atomic.h"
 #include "apr_poll.h"
-
+#include <stdint.h>
 #ifdef HAVE_OPENSSL
 #include "ssl_private.h"
 
