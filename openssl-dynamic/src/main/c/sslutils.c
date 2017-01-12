@@ -538,8 +538,7 @@ DH *SSL_callback_tmp_DH_4096(SSL *ssl, int export, int keylen)
  * format, possibly followed by a sequence of CA certificates that
  * should be sent to the peer in the SSL Certificate message.
  */
-int SSL_CTX_use_certificate_chain(SSL_CTX *ctx, const char *file,
-                                  int skipfirst)
+int SSL_CTX_use_certificate_chain(SSL_CTX *ctx, const char *file, bool skipfirst)
 {
     BIO *bio;
     int n;
@@ -555,8 +554,7 @@ int SSL_CTX_use_certificate_chain(SSL_CTX *ctx, const char *file,
     return n;
 }
 
-int SSL_CTX_use_certificate_chain_bio(SSL_CTX *ctx, BIO *bio,
-                                  int skipfirst)
+static int SSL_CTX_setup_certs(SSL_CTX *ctx, BIO *bio, bool skipfirst, bool ca)
 {
     X509 *x509;
     unsigned long err;
@@ -570,18 +568,29 @@ int SSL_CTX_use_certificate_chain_bio(SSL_CTX *ctx, BIO *bio,
         X509_free(x509);
     }
 
-    /* free a perhaps already configured extra chain */
-    SSL_CTX_clear_extra_chain_certs(ctx);
-
-    /* create new extra chain by loading the certs */
     n = 0;
-    while ((x509 = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
-        if (SSL_CTX_add_extra_chain_cert(ctx, x509) != 1) {
-            X509_free(x509);
-            return -1;
+    if (ca) {
+        while ((x509 = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
+            if (SSL_CTX_add_client_CA(ctx, x509) != 1) {
+                X509_free(x509);
+                return -1;
+            }
+            n++;
         }
-        n++;
+    } else {
+        /* free a perhaps already configured extra chain */
+        SSL_CTX_clear_extra_chain_certs(ctx);
+
+        /* create new extra chain by loading the certs */
+        while ((x509 = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
+            if (SSL_CTX_add_extra_chain_cert(ctx, x509) != 1) {
+                X509_free(x509);
+                return -1;
+            }
+            n++;
+        }
     }
+
     /* Make sure that only the error is just an EOF */
     if ((err = ERR_peek_error()) > 0) {
         if (!(   ERR_GET_LIB(err) == ERR_LIB_PEM
@@ -593,17 +602,26 @@ int SSL_CTX_use_certificate_chain_bio(SSL_CTX *ctx, BIO *bio,
     return n;
 }
 
-int SSL_use_certificate_chain_bio(SSL *ssl, BIO *bio,
-                                  int skipfirst)
+int SSL_CTX_use_certificate_chain_bio(SSL_CTX *ctx, BIO *bio, bool skipfirst)
 {
-#if !defined(OPENSSL_IS_BORINGSSL) && (OPENSSL_VERSION_NUMBER < 0x1000200fL || LIBRESSL_VERSION_NUMBER < 0x20400000L)
+    return SSL_CTX_setup_certs(ctx, bio, skipfirst, false);
+}
+
+
+int SSL_CTX_use_client_CA_bio(SSL_CTX *ctx, BIO *bio)
+{
+    return SSL_CTX_setup_certs(ctx, bio, false, true);
+}
+
+int SSL_use_certificate_chain_bio(SSL *ssl, BIO *bio, bool skipfirst)
+{
+#if !defined(OPENSSL_IS_BORINGSSL) && (OPENSSL_VERSION_NUMBER < 0x10002000L || defined(LIBRESSL_VERSION_NUMBER))
     // Only supported on boringssl or openssl 1.0.2+
     return -1;
 #else
     X509 *x509;
     unsigned long err;
     int n;
-    STACK_OF(X509) *chain;
 
     /* optionally skip a leading server certificate */
     if (skipfirst) {
@@ -803,7 +821,7 @@ static int ssl_verify_CRL(int ok, X509_STORE_CTX *ctx, tcn_ssl_ctxt_t *c)
             X509_REVOKED *revoked =
                 sk_X509_REVOKED_value(X509_CRL_get_REVOKED(crl), i);
 
-#if OPENSSL_VERSION_NUMBER < 0x10100000L || LIBRESSL_VERSION_NUMBER < 0x20400000L
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
             ASN1_INTEGER *sn = revoked->serialNumber;
 #else
             ASN1_INTEGER *sn = X509_REVOKED_get0_serialNumber(revoked);
@@ -823,12 +841,34 @@ static int ssl_verify_CRL(int ok, X509_STORE_CTX *ctx, tcn_ssl_ctxt_t *c)
     return ok;
 }
 
+int tcn_EVP_PKEY_up_ref(EVP_PKEY* pkey) {
+#if defined(OPENSSL_IS_BORINGSSL)
+    // Workaround for https://bugs.chromium.org/p/boringssl/issues/detail?id=89#
+    EVP_PKEY_up_ref(pkey);
+    return 1;
+#elif OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+    return CRYPTO_add(&pkey->references, 1, CRYPTO_LOCK_EVP_PKEY);
+#else
+    return EVP_PKEY_up_ref(pkey);
+#endif
+}
+
+int tcn_X509_up_ref(X509* cert) {
+#if defined(OPENSSL_IS_BORINGSSL)
+    // Workaround for https://bugs.chromium.org/p/boringssl/issues/detail?id=89#
+    X509_up_ref(cert);
+    return 1;
+#elif OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+    return CRYPTO_add(&cert->references, 1, CRYPTO_LOCK_X509);
+#else
+    return X509_up_ref(cert);
+#endif
+}
+
 /*
  * This OpenSSL callback function is called when OpenSSL
  * does client authentication and verifies the certificate chain.
  */
-
-
 int SSL_callback_SSL_verify(int ok, X509_STORE_CTX *ctx)
 {
    /* Get Apache context back through OpenSSL context */
@@ -938,7 +978,7 @@ void SSL_callback_handshake(const SSL *ssl, int where, int rc)
         int state = SSL_get_state(ssl);
 
 
-#if OPENSSL_VERSION_NUMBER < 0x10100000L || LIBRESSL_VERSION_NUMBER < 0x20400000L
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
         if (state == SSL3_ST_SR_CLNT_HELLO_A
 #ifndef OPENSSL_IS_BORINGSSL
                 || state == SSL23_ST_SR_CLNT_HELLO_A
@@ -1441,11 +1481,15 @@ static OCSP_RESPONSE *get_ocsp_response(X509 *cert, X509 *issuer, char *url)
     }
 
     /* Create the OCSP request */
-    if (sscanf(c_port, "%d", &port) != 1)
-        goto end;
-    ocsp_req = OCSP_REQUEST_new();
-    if (ocsp_req == NULL)
+    if (sscanf(c_port, "%d", &port) != 1) {
+        sk_OCSP_CERTID_free(ids);
         return NULL;
+    }
+    ocsp_req = OCSP_REQUEST_new();
+    if (ocsp_req == NULL) {
+        sk_OCSP_CERTID_free(ids);
+        return NULL;
+    }
     if (add_ocsp_cert(&ocsp_req,cert,issuer,ids) == 0 )
         goto free_req;
 
@@ -1457,7 +1501,6 @@ static OCSP_RESPONSE *get_ocsp_response(X509 *cert, X509 *issuer, char *url)
 
     apr_sock = make_socket(hostname, port, mp);
     if (apr_sock == NULL) {
-        ocsp_resp = NULL;
         goto free_bio;
     }
 
@@ -1477,7 +1520,6 @@ free_req:
     sk_OCSP_CERTID_free(ids);
     OCSP_REQUEST_free(ocsp_req);
 
-end:
     return ocsp_resp;
 }
 

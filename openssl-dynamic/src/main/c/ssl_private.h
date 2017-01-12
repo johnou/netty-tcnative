@@ -41,6 +41,7 @@
 
 #include "apr_thread_rwlock.h"
 #include "apr_atomic.h"
+#include <stdbool.h>
 
 /* OpenSSL headers */
 #include <openssl/opensslv.h>
@@ -72,10 +73,6 @@
 #define SSL_ALGO_RSA     (1<<0)
 #define SSL_ALGO_DSA     (1<<1)
 #define SSL_ALGO_ALL     (SSL_ALGO_RSA|SSL_ALGO_DSA)
-
-#define SSL_AIDX_RSA     (0)
-#define SSL_AIDX_DSA     (1)
-#define SSL_AIDX_MAX     (2)
 
 /*
  * Define IDs for the temporary RSA keys and DH params
@@ -227,6 +224,24 @@ static const char* UNKNOWN_AUTH_METHOD = "UNKNOWN";
 #define HAVE_ECC              1
 #endif
 
+/* OpenSSL 1.0.2 compatibility */
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+#define TLS_method SSLv23_method
+#define TLS_client_method SSLv23_client_method
+#define TLS_server_method SSLv23_server_method
+#define OPENSSL_VERSION SSLEAY_VERSION
+#define OpenSSL_version SSLeay_version
+#define OPENSSL_malloc_init CRYPTO_malloc_init
+#define X509_REVOKED_get0_serialNumber(x) x->serialNumber
+#define OpenSSL_version_num SSLeay
+#define BIO_get_init(x)       (x->init)
+#define BIO_set_init(x,v)     (x->init=v)
+#define BIO_get_data(x)       (x->ptr)
+#define BIO_set_data(x,v)     (x->ptr=v)
+#define BIO_set_shutdown(x,v) (x->shutdown=v)
+#endif /* OPENSSL_VERSION_NUMBER < 0x10100000L */
+
+
 
 #define SSL_SELECTOR_FAILURE_NO_ADVERTISE                       0
 #define SSL_SELECTOR_FAILURE_CHOOSE_MY_LAST_PROTOCOL            1
@@ -277,10 +292,6 @@ struct tcn_ssl_ctxt_t {
     X509_STORE              *crl;
     /* pointer to the context verify store */
     X509_STORE              *store;
-    const char              *cert_files[SSL_AIDX_MAX];
-    const char              *key_files[SSL_AIDX_MAX];
-    X509                    *certs[SSL_AIDX_MAX];
-    EVP_PKEY                *keys[SSL_AIDX_MAX];
 
     int                     ca_certs;
     int                     shutdown_type;
@@ -377,11 +388,14 @@ DH         *SSL_callback_tmp_DH_1024(SSL *, int, int);
 DH         *SSL_callback_tmp_DH_2048(SSL *, int, int);
 DH         *SSL_callback_tmp_DH_4096(SSL *, int, int);
 void        SSL_callback_handshake(const SSL *, int, int);
-int         SSL_CTX_use_certificate_chain(SSL_CTX *, const char *, int);
-int         SSL_CTX_use_certificate_chain_bio(SSL_CTX *, BIO *, int);
-int         SSL_use_certificate_chain_bio(SSL *, BIO *, int);
+int         SSL_CTX_use_certificate_chain(SSL_CTX *, const char *, bool);
+int         SSL_CTX_use_certificate_chain_bio(SSL_CTX *, BIO *, bool);
+int         SSL_CTX_use_client_CA_bio(SSL_CTX *, BIO *);
+int         SSL_use_certificate_chain_bio(SSL *, BIO *, bool);
 X509        *load_pem_cert_bio(tcn_pass_cb_t *, const BIO *);
 EVP_PKEY    *load_pem_key_bio(tcn_pass_cb_t *, const BIO *);
+int         tcn_EVP_PKEY_up_ref(EVP_PKEY* pkey);
+int         tcn_X509_up_ref(X509* cert);
 
 int         SSL_callback_SSL_verify(int, X509_STORE_CTX *);
 int         SSL_rand_seed(const char *file);

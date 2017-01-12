@@ -39,9 +39,6 @@ tcn_pass_cb_t tcn_password_callback;
 /* Global reference to the pool used by the dynamic mutexes */
 static apr_pool_t *dynlockpool = NULL;
 
-static jclass byteArrayClass;
-static jclass stringClass;
-
 /* Dynamic lock structure */
 struct CRYPTO_dynlock_value {
     apr_pool_t *pool;
@@ -230,26 +227,35 @@ static const jint supported_ssl_opts = 0
 
 static int ssl_tmp_key_init_rsa(int bits, int idx)
 {
-#if (OPENSSL_VERSION_NUMBER < 0x10100000L) || defined(OPENSSL_USE_DEPRECATED)
-    if (!(SSL_temp_keys[idx] =
-          RSA_generate_key(bits, RSA_F4, NULL, NULL))) {
-#ifdef OPENSSL_FIPS
-        /**
-         * With FIPS mode short RSA keys cannot be
-         * generated.
-         */
-        if (bits < 1024)
-            return 0;
-        else
-#endif
-        return 1;
-    }
-    else {
+#if defined(OPENSSL_FIPS)
+    /**
+     * Short RSA keys cannot be generated in FIPS mode.
+     */
+    if (bits < 1024) {
+        SSL_temp_keys[idx] = NULL;
         return 0;
     }
-#else
-    return 0;
 #endif
+
+    BIGNUM *e = BN_new();
+    RSA *rsa = RSA_new();
+    int ret = 1;
+
+    if (e == NULL ||
+        rsa == NULL ||
+        !BN_set_word(e, RSA_F4) ||
+        RSA_generate_key_ex(rsa, bits, e, NULL) != 1) {
+        goto err;
+    }
+
+    SSL_temp_keys[idx] = rsa;
+    rsa = NULL;
+    ret = 0;
+
+err:
+    BN_free(e);
+    RSA_free(rsa);
+    return ret;
 }
 
 static int ssl_tmp_key_init_dh(int bits, int idx)
@@ -265,17 +271,21 @@ static int ssl_tmp_key_init_dh(int bits, int idx)
 #endif
 }
 
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
+ static void init_bio_methods(void);
+ static void free_bio_methods(void);
+#endif
 
 TCN_IMPLEMENT_CALL(jint, SSL, version)(TCN_STDARGS)
 {
     UNREFERENCED_STDARGS;
-    return (jint) SSLeay();
+    return OpenSSL_version_num();
 }
 
 TCN_IMPLEMENT_CALL(jstring, SSL, versionString)(TCN_STDARGS)
 {
     UNREFERENCED(o);
-    return AJP_TO_JSTRING(SSLeay_version(SSLEAY_VERSION));
+    return AJP_TO_JSTRING(OpenSSL_version(OPENSSL_VERSION));
 }
 
 /*
@@ -316,7 +326,12 @@ static apr_status_t ssl_init_cleanup(void *data)
 #if OPENSSL_VERSION_NUMBER >= 0x00907001
     CRYPTO_cleanup_all_ex_data();
 #endif
-    ERR_remove_state(0);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    ERR_remove_thread_state(NULL);
+#endif
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
+    free_bio_methods();
+#endif
 
     /* Don't call ERR_free_strings here; ERR_load_*_strings only
      * actually load the error strings once per process due to static
@@ -388,11 +403,16 @@ static unsigned long ssl_thread_id(void)
 #endif
 }
 
+static void ssl_set_thread_id(CRYPTO_THREADID *id)
+{
+    CRYPTO_THREADID_set_numeric(id, ssl_thread_id());
+}
+
 static apr_status_t ssl_thread_cleanup(void *data)
 {
     UNREFERENCED(data);
     CRYPTO_set_locking_callback(NULL);
-    CRYPTO_set_id_callback(NULL);
+    CRYPTO_THREADID_set_callback(NULL);
     CRYPTO_set_dynlock_create_callback(NULL);
     CRYPTO_set_dynlock_lock_callback(NULL);
     CRYPTO_set_dynlock_destroy_callback(NULL);
@@ -492,7 +512,7 @@ static void ssl_thread_setup(apr_pool_t *p)
                                 APR_THREAD_MUTEX_DEFAULT, p);
     }
 
-    CRYPTO_set_id_callback(ssl_thread_id);
+    CRYPTO_THREADID_set_callback(ssl_set_thread_id);
     CRYPTO_set_locking_callback(ssl_thread_lock);
 
     /* Set up dynamic locking scaffolding for OpenSSL to use at its
@@ -651,8 +671,6 @@ static int ssl_rand_make(const char *file, int len, int base64)
 TCN_IMPLEMENT_CALL(jint, SSL, initialize)(TCN_STDARGS, jstring engine)
 {
     int r = 0;
-    jclass clazz;
-    jclass sClazz;
 
     TCN_ALLOC_CSTRING(engine);
 
@@ -678,15 +696,10 @@ TCN_IMPLEMENT_CALL(jint, SSL, initialize)(TCN_STDARGS, jstring engine)
 #endif
 
 #ifndef OPENSSL_IS_BORINGSSL
-#if OPENSSL_VERSION_NUMBER < 0x10100000L || LIBRESSL_VERSION_NUMBER < 0x20400000L
-
     /* We must register the library in full, to ensure our configuration
      * code can successfully test the SSL environment.
      */
-    CRYPTO_malloc_init();
-#else
     OPENSSL_malloc_init();
-#endif
 #endif
 
     ERR_load_crypto_strings();
@@ -745,8 +758,13 @@ TCN_IMPLEMENT_CALL(jint, SSL, initialize)(TCN_STDARGS, jstring engine)
     /* For SSL_get_app_data2() and SSL_get_app_data3() at request time */
     SSL_init_app_data2_3_idx();
 
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
+    init_bio_methods();
+#endif
+
     SSL_TMP_KEYS_INIT(r);
     if (r) {
+        ERR_clear_error();
         TCN_FREE_CSTRING(engine);
         ssl_init_cleanup(NULL);
         tcn_ThrowAPRException(e, APR_ENOTIMPL);
@@ -759,14 +777,6 @@ TCN_IMPLEMENT_CALL(jint, SSL, initialize)(TCN_STDARGS, jstring engine)
                               ssl_init_cleanup,
                               apr_pool_cleanup_null);
     TCN_FREE_CSTRING(engine);
-
-    // Cache the byte[].class for performance reasons
-    clazz = (*e)->FindClass(e, "[B");
-    byteArrayClass = (jclass) (*e)->NewGlobalRef(e, clazz);
-
-    // Cache the String.class for performance reasons
-    sClazz = (*e)->FindClass(e, "java/lang/String");
-    stringClass = (jclass) (*e)->NewGlobalRef(e, sClazz);
 
     return (jint)APR_SUCCESS;
 }
@@ -871,10 +881,11 @@ static apr_status_t generic_bio_cleanup(void *data)
 
 void SSL_BIO_close(BIO *bi)
 {
+    BIO_JAVA *j = NULL;
     if (bi == NULL)
         return;
-    if (bi->ptr != NULL && (bi->flags & SSL_BIO_FLAG_CALLBACK)) {
-        BIO_JAVA *j = (BIO_JAVA *)bi->ptr;
+    j = (BIO_JAVA *)BIO_get_data(bi);
+    if (j != NULL && BIO_test_flags(bi, SSL_BIO_FLAG_CALLBACK)) {
         j->refcount--;
         if (j->refcount == 0) {
             if (j->pool)
@@ -889,9 +900,11 @@ void SSL_BIO_close(BIO *bi)
 
 void SSL_BIO_doref(BIO *bi)
 {
+    BIO_JAVA *j = NULL;
     if (bi == NULL)
         return;
-    if (bi->ptr != NULL && (bi->flags & SSL_BIO_FLAG_CALLBACK)) {
+    j = (BIO_JAVA *)BIO_get_data(bi);
+    if (j != NULL && BIO_test_flags(bi, SSL_BIO_FLAG_CALLBACK)) {
         BIO_JAVA *j = (BIO_JAVA *)bi->ptr;
         j->refcount++;
     }
@@ -900,16 +913,22 @@ void SSL_BIO_doref(BIO *bi)
 
 static int jbs_new(BIO *bi)
 {
-    BIO_JAVA *j;
+    BIO_JAVA *j = NULL;
 
     if ((j = OPENSSL_malloc(sizeof(BIO_JAVA))) == NULL)
         return 0;
     j->pool      = NULL;
     j->refcount  = 1;
-    bi->shutdown = 1;
-    bi->init     = 0;
+    BIO_set_shutdown(bi, 1);
+    BIO_set_init(bi, 0);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    /* No setter method for OpenSSL 1.1.0 available,
+     * but I can't find any functional use of the
+     * "num" field there either.
+     */
     bi->num      = -1;
-    bi->ptr      = (char *)j;
+#endif
+    BIO_set_data(bi, (void *)j);
 
     return 1;
 }
@@ -917,20 +936,20 @@ static int jbs_new(BIO *bi)
 static int jbs_free(BIO *bi)
 {
     JNIEnv *e = NULL;
-    BIO_JAVA *j;
+    BIO_JAVA *j = NULL;
 
     if (bi == NULL)
         return 0;
-    if (bi->ptr != NULL) {
-        j = (BIO_JAVA *)bi->ptr;
-        if (bi->init) {
-            bi->init = 0;
+    j = (BIO_JAVA *)BIO_get_data(bi);
+    if (j != NULL) {
+        if (BIO_get_init(bi)) {
+            BIO_set_init(bi, 0);
             tcn_get_java_env(&e);
             TCN_UNLOAD_CLASS(e, j->cb.obj);
         }
-        OPENSSL_free(bi->ptr);
+        OPENSSL_free(j);
     }
-    bi->ptr = NULL;
+    BIO_set_data(bi, NULL);
     return 1;
 }
 
@@ -938,8 +957,8 @@ static int jbs_write(BIO *b, const char *in, int inl)
 {
     jint ret = -1;
 
-    if (b->init && in != NULL) {
-        BIO_JAVA *j = (BIO_JAVA *)b->ptr;
+    if (BIO_get_init(b) && in != NULL) {
+        BIO_JAVA *j = (BIO_JAVA *)BIO_get_data(b);
         JNIEnv   *e = NULL;
         jbyteArray jb;
         tcn_get_java_env(&e);
@@ -964,8 +983,8 @@ static int jbs_read(BIO *b, char *out, int outl)
     jint ret = 0;
     jbyte *jout;
 
-    if (b->init && out != NULL) {
-        BIO_JAVA *j = (BIO_JAVA *)b->ptr;
+    if (BIO_get_init(b) && out != NULL) {
+        BIO_JAVA *j = (BIO_JAVA *)BIO_get_data(b);
         JNIEnv   *e = NULL;
         jbyteArray jb;
         tcn_get_java_env(&e);
@@ -992,10 +1011,10 @@ static int jbs_puts(BIO *b, const char *in)
 {
     int ret = 0;
     JNIEnv *e = NULL;
-    BIO_JAVA *j;
+    BIO_JAVA *j = NULL;
 
-    if (b->init && in != NULL) {
-        j = (BIO_JAVA *)b->ptr;
+    if (BIO_get_init(b) && in != NULL) {
+        BIO_JAVA *j = (BIO_JAVA *)BIO_get_data(b);
         tcn_get_java_env(&e);
         ret = (*e)->CallIntMethod(e, j->cb.obj,
                                   j->cb.mid[2],
@@ -1008,12 +1027,12 @@ static int jbs_gets(BIO *b, char *out, int outl)
 {
     int ret = 0;
     JNIEnv *e = NULL;
-    BIO_JAVA *j;
+    BIO_JAVA *j = NULL;
     jobject o;
     int l;
 
-    if (b->init && out != NULL) {
-        j = (BIO_JAVA *)b->ptr;
+    if (BIO_get_init(b) && out != NULL) {
+        BIO_JAVA *j = (BIO_JAVA *)BIO_get_data(b);
         tcn_get_java_env(&e);
         if ((o = (*e)->CallObjectMethod(e, j->cb.obj,
                             j->cb.mid[3], (jint)(outl - 1)))) {
@@ -1045,6 +1064,7 @@ static long jbs_ctrl(BIO *b, int cmd, long num, void *ptr)
     return ret;
 }
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 static BIO_METHOD jbs_methods = {
     BIO_TYPE_FILE,
     "Java Callback",
@@ -1057,10 +1077,34 @@ static BIO_METHOD jbs_methods = {
     jbs_free,
     NULL
 };
+#else
+static BIO_METHOD *jbs_methods = NULL;
+
+static void init_bio_methods(void)
+{
+    jbs_methods = BIO_meth_new(BIO_TYPE_FILE, "Java Callback");
+    BIO_meth_set_write(jbs_methods, &jbs_write);
+    BIO_meth_set_read(jbs_methods, &jbs_read);
+    BIO_meth_set_puts(jbs_methods, &jbs_puts);
+    BIO_meth_set_gets(jbs_methods, &jbs_gets);
+    BIO_meth_set_ctrl(jbs_methods, &jbs_ctrl);
+    BIO_meth_set_create(jbs_methods, &jbs_new);
+    BIO_meth_set_destroy(jbs_methods, &jbs_free);
+}
+
+static void free_bio_methods(void)
+{
+    BIO_meth_free(jbs_methods);
+}
+#endif
 
 static BIO_METHOD *BIO_jbs()
 {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
     return(&jbs_methods);
+#else
+    return jbs_methods;
+#endif
 }
 
 
@@ -1082,7 +1126,7 @@ TCN_IMPLEMENT_CALL(jlong, SSL, newBIO)(TCN_STDARGS, jlong pool,
                                        jobject callback)
 {
     BIO *bio = NULL;
-    BIO_JAVA *j;
+    BIO_JAVA *j = NULL;
     jclass cls;
 
     UNREFERENCED(o);
@@ -1091,7 +1135,7 @@ TCN_IMPLEMENT_CALL(jlong, SSL, newBIO)(TCN_STDARGS, jlong pool,
         tcn_ThrowException(e, "Create BIO failed");
         goto init_failed;
     }
-    j = (BIO_JAVA *)bio->ptr;
+    j = (BIO_JAVA *)BIO_get_data(bio);
     if (j == NULL) {
         tcn_ThrowException(e, "Create BIO failed");
         goto init_failed;
@@ -1111,10 +1155,11 @@ TCN_IMPLEMENT_CALL(jlong, SSL, newBIO)(TCN_STDARGS, jlong pool,
     /* TODO: Check if method id's are valid */
     j->cb.obj    = (*e)->NewGlobalRef(e, callback);
 
-    bio->init  = 1;
-    bio->flags = SSL_BIO_FLAG_CALLBACK;
+    BIO_set_init(bio, 1);
+    BIO_set_flags(bio, SSL_BIO_FLAG_CALLBACK);
     return P2J(bio);
 init_failed:
+    BIO_free(bio); // this function is safe to call with NULL.
     return 0;
 }
 
@@ -1249,7 +1294,6 @@ TCN_IMPLEMENT_CALL(jlong /* SSL * */, SSL, newSSL)(TCN_STDARGS,
 
     UNREFERENCED_STDARGS;
 
-    handshakeCount = malloc(sizeof(int));
     ssl = SSL_new(c->ctx);
     if (ssl == NULL) {
         tcn_ThrowException(e, "cannot create new ssl");
@@ -1257,6 +1301,7 @@ TCN_IMPLEMENT_CALL(jlong /* SSL * */, SSL, newSSL)(TCN_STDARGS,
     }
 
     // Store the handshakeCount in the SSL instance.
+    handshakeCount = malloc(sizeof(int));
     *handshakeCount = 0;
     SSL_set_app_data3(ssl, handshakeCount);
 
@@ -1385,6 +1430,20 @@ TCN_IMPLEMENT_CALL(jint /* status */, SSL, readFromBIO)(TCN_STDARGS,
     return BIO_read(b, r, rlen);
 }
 
+TCN_IMPLEMENT_CALL(jboolean, SSL, shouldRetryBIO)(TCN_STDARGS,
+                                                        jlong bio /* BIO * */) {
+    BIO *b = J2P(bio, BIO *);
+
+    if (b == NULL) {
+        tcn_ThrowException(e, "bio is null");
+        return 0;
+    }
+
+    UNREFERENCED_STDARGS;
+
+    return BIO_should_retry(b) ? JNI_TRUE : JNI_FALSE;
+}
+
 // Write up to wlen bytes of application data to the ssl BIO (encrypt)
 TCN_IMPLEMENT_CALL(jint /* status */, SSL, writeToSSL)(TCN_STDARGS,
                                                        jlong ssl /* SSL * */,
@@ -1479,9 +1538,12 @@ TCN_IMPLEMENT_CALL(void, SSL, freeSSL)(TCN_STDARGS,
     SSL_free(ssl_);
 }
 
-// Make a BIO pair (network and internal) for the provided SSL * and return the network BIO
-TCN_IMPLEMENT_CALL(jlong, SSL, makeNetworkBIO)(TCN_STDARGS,
-                                               jlong ssl /* SSL * */) {
+// Make a BIO pair (network and internal) for the provided SSL * which has a
+// maximum size of max_bio_size, and return the network BIO.
+// The value max_bio_size = 0 can be supplied to use the default BIO size.
+TCN_IMPLEMENT_CALL(jlong, SSL, makeNetworkBIO0)(TCN_STDARGS,
+                                               jlong ssl /* SSL * */,
+                                               jint maxInternalBIOSize, jint maxNetworkBIOSize) {
     SSL *ssl_ = J2P(ssl, SSL *);
     BIO *internal_bio;
     BIO *network_bio;
@@ -1491,7 +1553,21 @@ TCN_IMPLEMENT_CALL(jlong, SSL, makeNetworkBIO)(TCN_STDARGS,
         return 0;
     }
 
-    if (BIO_new_bio_pair(&internal_bio, 0, &network_bio, 0) != 1) {
+    if (maxInternalBIOSize < 0) {
+        tcn_ThrowException(e, "maxInternalBIOSize < 0");
+        return 0;
+    }
+
+    if (maxNetworkBIOSize < 0) {
+        tcn_ThrowException(e, "maxNetworkBIOSize < 0");
+        return 0;
+    }
+
+    if (BIO_new_bio_pair(
+            &internal_bio,
+            (size_t) maxInternalBIOSize,
+            &network_bio,
+            (size_t) maxNetworkBIOSize) != 1) {
         tcn_ThrowException(e, "BIO_new_bio_pair failed");
         return 0;
     }
@@ -1658,6 +1734,7 @@ TCN_IMPLEMENT_CALL(jobjectArray, SSL, getPeerCertChain)(TCN_STDARGS,
     unsigned char *buf;
     jobjectArray array;
     jbyteArray bArray;
+    jclass byteArrayClass = tcn_get_byte_array_class();
 
     SSL *ssl_ = J2P(ssl, SSL *);
 
@@ -1671,7 +1748,7 @@ TCN_IMPLEMENT_CALL(jobjectArray, SSL, getPeerCertChain)(TCN_STDARGS,
     // Get a stack of all certs in the chain.
     sk = SSL_get_peer_cert_chain(ssl_);
 
-    len = sk_num((_STACK*) sk);
+    len = sk_X509_num(sk);
     if (len <= 0) {
         // No peer certificate chain as no auth took place yet, or the auth was not successful.
         return NULL;
@@ -1680,7 +1757,7 @@ TCN_IMPLEMENT_CALL(jobjectArray, SSL, getPeerCertChain)(TCN_STDARGS,
     array = (*e)->NewObjectArray(e, len, byteArrayClass, NULL);
 
     for(i = 0; i < len; i++) {
-        cert = (X509*) sk_value((_STACK*) sk, i);
+        cert = sk_X509_value(sk, i);
 
         buf = NULL;
         length = i2d_X509(cert, &buf);
@@ -1919,7 +1996,7 @@ TCN_IMPLEMENT_CALL(jobjectArray, SSL, getCiphers)(TCN_STDARGS, jlong ssl)
     STACK_OF(SSL_CIPHER) *sk;
     int len;
     jobjectArray array;
-    SSL_CIPHER *cipher;
+    const SSL_CIPHER *cipher;
     const char *name;
     int i;
     jstring c_name;
@@ -1933,7 +2010,7 @@ TCN_IMPLEMENT_CALL(jobjectArray, SSL, getCiphers)(TCN_STDARGS, jlong ssl)
     UNREFERENCED_STDARGS;
 
     sk = SSL_get_ciphers(ssl_);
-    len = sk_num((_STACK*) sk);
+    len = sk_SSL_CIPHER_num(sk);
 
     if (len <= 0) {
         // No peer certificate chain as no auth took place yet, or the auth was not successful.
@@ -1941,10 +2018,10 @@ TCN_IMPLEMENT_CALL(jobjectArray, SSL, getCiphers)(TCN_STDARGS, jlong ssl)
     }
 
     // Create the byte[][] array that holds all the certs
-    array = (*e)->NewObjectArray(e, len, stringClass, NULL);
+    array = (*e)->NewObjectArray(e, len, tcn_get_string_class(), NULL);
 
     for (i = 0; i < len; i++) {
-        cipher = (SSL_CIPHER*) sk_value((_STACK*) sk, i);
+        cipher = sk_SSL_CIPHER_value(sk, i);
         name = SSL_CIPHER_get_name(cipher);
 
         c_name = (*e)->NewStringUTF(e, name);
@@ -2099,9 +2176,9 @@ TCN_IMPLEMENT_CALL(jobjectArray, SSL, authenticationMethods)(TCN_STDARGS, jlong 
     UNREFERENCED(o);
 
     ciphers = SSL_get_ciphers(ssl_);
-    len = sk_num((_STACK*) ciphers);
+    len = sk_SSL_CIPHER_num(ciphers);
 
-    array = (*e)->NewObjectArray(e, len, stringClass, NULL);
+    array = (*e)->NewObjectArray(e, len, tcn_get_string_class(), NULL);
 
     for (i = 0; i < len; i++) {
         (*e)->SetObjectArrayElement(e, array, i,
@@ -2117,9 +2194,9 @@ TCN_IMPLEMENT_CALL(void, SSL, setCertificateBio)(TCN_STDARGS, jlong ssl,
     SSL *ssl_ = J2P(ssl, SSL *);
     BIO *cert_bio = J2P(cert, BIO *);
     BIO *key_bio = J2P(key, BIO *);
-    EVP_PKEY* pkey;
-    X509* xcert;
-    tcn_pass_cb_t* cb_data;
+    EVP_PKEY* pkey = NULL;
+    X509* xcert = NULL;
+    tcn_pass_cb_t* cb_data = NULL;
     TCN_ALLOC_CSTRING(password);
     char err[ERR_LEN];
 
@@ -2176,6 +2253,8 @@ TCN_IMPLEMENT_CALL(void, SSL, setCertificateBio)(TCN_STDARGS, jlong ssl,
     }
 cleanup:
     TCN_FREE_CSTRING(password);
+    EVP_PKEY_free(pkey); // this function is safe to call with NULL
+    X509_free(xcert); // this function is safe to call with NULL
 }
 
 TCN_IMPLEMENT_CALL(void, SSL, setCertificateChainBio)(TCN_STDARGS, jlong ssl,
@@ -2195,6 +2274,99 @@ TCN_IMPLEMENT_CALL(void, SSL, setCertificateChainBio)(TCN_STDARGS, jlong ssl,
         ERR_clear_error();
         tcn_Throw(e, "Error setting certificate chain (%s)", err);
     }
+}
+
+TCN_IMPLEMENT_CALL(long, SSL, parsePrivateKey)(TCN_STDARGS, jlong privateKeyBio, jstring password)
+{
+    EVP_PKEY* pkey = NULL;
+    BIO *bio = J2P(privateKeyBio, BIO *);
+    tcn_pass_cb_t* cb_data = &tcn_password_callback;
+    TCN_ALLOC_CSTRING(password);
+    char err[ERR_LEN];
+
+    UNREFERENCED(o);
+
+    if (bio == NULL) {
+        tcn_Throw(e, "Unable to load certificate key");
+        goto cleanup;
+    }
+
+    cb_data->password[0] = '\0';
+    if (J2S(password) != NULL) {
+        strncat(cb_data->password, J2S(password), SSL_MAX_PASSWORD_LEN - 1);
+    }
+
+    if ((pkey = load_pem_key_bio(cb_data, bio)) == NULL) {
+        ERR_error_string_n(ERR_get_error(), err, ERR_LEN);
+        ERR_clear_error();
+        tcn_Throw(e, "Unable to load certificate key (%s)",err);
+        goto cleanup;
+    }
+
+cleanup:
+    TCN_FREE_CSTRING(password);
+    return P2J(pkey);
+}
+
+TCN_IMPLEMENT_CALL(void, SSL, freePrivateKey)(TCN_STDARGS, jlong privateKey)
+{
+    EVP_PKEY *key = J2P(privateKey, EVP_PKEY *);
+    UNREFERENCED(o);
+    EVP_PKEY_free(key); // Safe to call with NULL as well.
+}
+
+TCN_IMPLEMENT_CALL(long, SSL, parseX509Chain)(TCN_STDARGS, jlong x509ChainBio)
+{
+    BIO *cert_bio = J2P(x509ChainBio, BIO *);
+    X509* cert = NULL;
+    STACK_OF(X509) *chain = NULL;
+    char err[ERR_LEN];
+    unsigned long error;
+    int n = 0;
+
+    UNREFERENCED(o);
+
+    if (cert_bio == NULL) {
+        tcn_Throw(e, "No Certificate specified or invalid format");
+        goto cleanup;
+    }
+
+    chain = sk_X509_new_null();
+    while ((cert = PEM_read_bio_X509(cert_bio, NULL, NULL, NULL)) != NULL) {
+        if (sk_X509_push(chain, cert) <= 0) {
+            tcn_Throw(e, "No Certificate specified or invalid format");
+            goto cleanup;
+        }
+        cert = NULL;
+        n++;
+    }
+
+    // ensure that if we have an error its just for EOL.
+    if ((error = ERR_peek_error()) > 0) {
+        if (!(ERR_GET_LIB(error) == ERR_LIB_PEM
+              && ERR_GET_REASON(error) == PEM_R_NO_START_LINE)) {
+
+            ERR_error_string_n(ERR_get_error(), err, ERR_LEN);
+            tcn_Throw(e, "Invalid format (%s)", err);
+            goto cleanup;
+        }
+        ERR_clear_error();
+    }
+
+    return P2J(chain);
+
+cleanup:
+    ERR_clear_error();
+    sk_X509_pop_free(chain, X509_free);
+    X509_free(cert);
+    return 0;
+}
+
+TCN_IMPLEMENT_CALL(void, SSL, freeX509Chain)(TCN_STDARGS, jlong x509Chain)
+{
+    STACK_OF(X509) *chain = J2P(x509Chain, STACK_OF(X509) *);
+    UNREFERENCED(o);
+    sk_X509_pop_free(chain, X509_free);
 }
 
 /*** End Apple API Additions ***/
@@ -2388,6 +2560,13 @@ TCN_IMPLEMENT_CALL(jint, SSL, readFromBIO)(TCN_STDARGS, jlong bio, jlong rbuf, j
   return 0;
 }
 
+TCN_IMPLEMENT_CALL(jboolean, SSL, shouldRetryBIO)(TCN_STDARGS, jlong bio) {
+  UNREFERENCED(o);
+  UNREFERENCED(bio);
+  tcn_ThrowException(e, "Not implemented");
+  return JNI_FALSE;
+}
+
 TCN_IMPLEMENT_CALL(jint, SSL, writeToSSL)(TCN_STDARGS, jlong ssl, jlong wbuf, jint wlen) {
   UNREFERENCED(o);
   UNREFERENCED(ssl);
@@ -2426,9 +2605,12 @@ TCN_IMPLEMENT_CALL(void, SSL, freeSSL)(TCN_STDARGS, jlong ssl) {
   tcn_ThrowException(e, "Not implemented");
 }
 
-TCN_IMPLEMENT_CALL(jlong, SSL, makeNetworkBIO)(TCN_STDARGS, jlong ssl) {
+TCN_IMPLEMENT_CALL(jlong, SSL, makeNetworkBIO)(TCN_STDARGS, jlong ssl, jint maxInternalBIOSize, jint maxNetworkBIOSize) {
   UNREFERENCED(o);
   UNREFERENCED(ssl);
+  UNREFERENCED(maxInternalBIOSize);
+  UNREFERENCED(maxNetworkBIOSize);
+
   tcn_ThrowException(e, "Not implemented");
   return 0;
 }
@@ -2632,6 +2814,38 @@ TCN_IMPLEMENT_CALL(jobjectArray, SSL, authenticationMethods)(TCN_STDARGS, jlong 
   UNREFERENCED(o);
   UNREFERENCED(ssl);
   tcn_ThrowException(e, "Not implemented");
+}
+
+
+TCN_IMPLEMENT_CALL(long, SSL, parsePrivateKey)(TCN_STDARGS, jlong privateKeyBio, jstring password)
+{
+     UNREFERENCED(o);
+     UNREFERENCED(privateKeyBio);
+     UNREFERENCED(password);
+     tcn_ThrowException(e, "Not implemented");
+     return 0;
+}
+
+TCN_IMPLEMENT_CALL(void, SSL, freePrivateKey)(TCN_STDARGS, jlong privateKey)
+{
+     UNREFERENCED(o);
+     UNREFERENCED(privateKey);
+     tcn_ThrowException(e, "Not implemented");
+}
+
+TCN_IMPLEMENT_CALL(long, SSL, parseX509Chain)(TCN_STDARGS, jlong x509ChainBio)
+{
+     UNREFERENCED(o);
+     UNREFERENCED(x509ChainBio);
+     tcn_ThrowException(e, "Not implemented");
+     return 0;
+}
+
+TCN_IMPLEMENT_CALL(void, SSL, freeX509Chain)(TCN_STDARGS, jlong x509Chain)
+{
+    UNREFERENCED(o);
+    UNREFERENCED(x509Chain);
+    tcn_ThrowException(e, "Not implemented");
 }
 /*** End Apple API Additions ***/
 #endif

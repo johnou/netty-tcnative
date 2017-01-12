@@ -32,31 +32,17 @@
 #include "ssl_private.h"
 #include <stdint.h>
 
-static jclass byteArrayClass;
-
 static apr_status_t ssl_context_cleanup(void *data)
 {
     tcn_ssl_ctxt_t *c = (tcn_ssl_ctxt_t *)data;
     JNIEnv *e;
 
     if (c) {
-        int i;
         if (c->crl != NULL)
             X509_STORE_free(c->crl);
         c->crl = NULL;
-        if (c->ctx != NULL)
-            SSL_CTX_free(c->ctx);
+        SSL_CTX_free(c->ctx); // this function is safe to call with NULL
         c->ctx = NULL;
-        for (i = 0; i < SSL_AIDX_MAX; i++) {
-            if (c->certs[i] != NULL) {
-                X509_free(c->certs[i]);
-                c->certs[i] = NULL;
-            }
-            if (c->keys[i] != NULL) {
-                EVP_PKEY_free(c->keys[i]);
-                c->keys[i] = NULL;
-            }
-        }
         if (c->bio_is != NULL ) {
             SSL_BIO_close(c->bio_is);
             c->bio_is = NULL;
@@ -110,7 +96,6 @@ TCN_IMPLEMENT_CALL(jlong, SSLContext, make)(TCN_STDARGS, jlong pool,
     apr_pool_t *p = J2P(pool, apr_pool_t *);
     tcn_ssl_ctxt_t *c = NULL;
     SSL_CTX *ctx = NULL;
-    jclass clazz;
 
     UNREFERENCED(o);
 
@@ -229,7 +214,7 @@ TCN_IMPLEMENT_CALL(jlong, SSLContext, make)(TCN_STDARGS, jlong pool,
         goto init_failed;
     }
 
-    if (!ctx) {
+    if (ctx == NULL) {
         char err[256];
         ERR_error_string(ERR_get_error(), err);
         tcn_Throw(e, "Failed to initialize SSL_CTX (%s)", err);
@@ -337,13 +322,9 @@ TCN_IMPLEMENT_CALL(jlong, SSLContext, make)(TCN_STDARGS, jlong pool,
                               ssl_context_cleanup,
                               apr_pool_cleanup_null);
 
-
-    // Cache the byte[].class for performance reasons
-    clazz = (*e)->FindClass(e, "[B");
-    byteArrayClass = (jclass) (*e)->NewGlobalRef(e, clazz);
-
     return P2J(c);
 init_failed:
+    SSL_CTX_free(ctx); // this function is safe to call with NULL.
     return 0;
 }
 
@@ -610,6 +591,17 @@ cleanup:
     TCN_FREE_CSTRING(file);
     TCN_FREE_CSTRING(path);
     return rv;
+}
+
+TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCACertificateBio)(TCN_STDARGS, jlong ctx, jlong certs)
+{
+    tcn_ssl_ctxt_t *c = J2P(ctx, tcn_ssl_ctxt_t *);
+    BIO *b = J2P(certs, BIO *);
+
+    UNREFERENCED(o);
+    TCN_ASSERT(c != NULL);
+
+    return b != NULL && c->mode != SSL_MODE_CLIENT && SSL_CTX_use_client_CA_bio(c->ctx, b) > 0 ? JNI_TRUE : JNI_FALSE;
 }
 
 TCN_IMPLEMENT_CALL(void, SSLContext, setTmpDH)(TCN_STDARGS, jlong ctx,
@@ -892,13 +884,15 @@ TCN_IMPLEMENT_CALL(void, SSLContext, setRandom)(TCN_STDARGS, jlong ctx,
 
 TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCertificate)(TCN_STDARGS, jlong ctx,
                                                          jstring cert, jstring key,
-                                                         jstring password, jint idx)
+                                                         jstring password)
 {
     tcn_ssl_ctxt_t *c = J2P(ctx, tcn_ssl_ctxt_t *);
     jboolean rv = JNI_TRUE;
     TCN_ALLOC_CSTRING(cert);
     TCN_ALLOC_CSTRING(key);
     TCN_ALLOC_CSTRING(password);
+    EVP_PKEY *pkey = NULL;
+    X509 *xcert = NULL;
     const char *key_file, *cert_file;
     const char *p;
     char err[256];
@@ -906,11 +900,6 @@ TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCertificate)(TCN_STDARGS, jlong ctx,
     UNREFERENCED(o);
     TCN_ASSERT(ctx != 0);
 
-    if (idx < 0 || idx >= SSL_AIDX_MAX) {
-        /* TODO: Throw something */
-        rv = JNI_FALSE;
-        goto cleanup;
-    }
     if (J2S(password)) {
         if (!c->cb_data)
             c->cb_data = &tcn_password_callback;
@@ -927,7 +916,7 @@ TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCertificate)(TCN_STDARGS, jlong ctx,
         goto cleanup;
     }
     if ((p = strrchr(cert_file, '.')) != NULL && strcmp(p, ".pkcs12") == 0) {
-        if (!ssl_load_pkcs12(c, cert_file, &c->keys[idx], &c->certs[idx], 0)) {
+        if (!ssl_load_pkcs12(c, cert_file, &pkey, &xcert, 0)) {
             ERR_error_string(ERR_get_error(), err);
             tcn_Throw(e, "Unable to load certificate %s (%s)",
                       cert_file, err);
@@ -936,14 +925,14 @@ TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCertificate)(TCN_STDARGS, jlong ctx,
         }
     }
     else {
-        if ((c->keys[idx] = load_pem_key(c, key_file)) == NULL) {
+        if ((pkey = load_pem_key(c, key_file)) == NULL) {
             ERR_error_string(ERR_get_error(), err);
             tcn_Throw(e, "Unable to load certificate key %s (%s)",
                       key_file, err);
             rv = JNI_FALSE;
             goto cleanup;
         }
-        if ((c->certs[idx] = load_pem_cert(c, cert_file)) == NULL) {
+        if ((xcert = load_pem_cert(c, cert_file)) == NULL) {
             ERR_error_string(ERR_get_error(), err);
             tcn_Throw(e, "Unable to load certificate %s (%s)",
                       cert_file, err);
@@ -951,13 +940,13 @@ TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCertificate)(TCN_STDARGS, jlong ctx,
             goto cleanup;
         }
     }
-    if (SSL_CTX_use_certificate(c->ctx, c->certs[idx]) <= 0) {
+    if (SSL_CTX_use_certificate(c->ctx, xcert) <= 0) {
         ERR_error_string(ERR_get_error(), err);
         tcn_Throw(e, "Error setting certificate (%s)", err);
         rv = JNI_FALSE;
         goto cleanup;
     }
-    if (SSL_CTX_use_PrivateKey(c->ctx, c->keys[idx]) <= 0) {
+    if (SSL_CTX_use_PrivateKey(c->ctx, pkey) <= 0) {
         ERR_error_string(ERR_get_error(), err);
         tcn_Throw(e, "Error setting private key (%s)", err);
         rv = JNI_FALSE;
@@ -974,16 +963,20 @@ cleanup:
     TCN_FREE_CSTRING(cert);
     TCN_FREE_CSTRING(key);
     TCN_FREE_CSTRING(password);
+    EVP_PKEY_free(pkey); // this function is safe to call with NULL
+    X509_free(xcert); // this function is safe to call with NULL
     return rv;
 }
 
 TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCertificateBio)(TCN_STDARGS, jlong ctx,
                                                          jlong cert, jlong key,
-                                                         jstring password, jint idx)
+                                                         jstring password)
 {
     tcn_ssl_ctxt_t *c = J2P(ctx, tcn_ssl_ctxt_t *);
     BIO *cert_bio = J2P(cert, BIO *);
     BIO *key_bio = J2P(key, BIO *);
+    EVP_PKEY *pkey = NULL;
+    X509 *xcert = NULL;
 
     jboolean rv = JNI_TRUE;
     TCN_ALLOC_CSTRING(password);
@@ -992,11 +985,6 @@ TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCertificateBio)(TCN_STDARGS, jlong c
     UNREFERENCED(o);
     TCN_ASSERT(ctx != 0);
 
-    if (idx < 0 || idx >= SSL_AIDX_MAX) {
-        /* TODO: Throw something */
-        rv = JNI_FALSE;
-        goto cleanup;
-    }
     if (J2S(password)) {
         if (!c->cb_data)
             c->cb_data = &tcn_password_callback;
@@ -1011,14 +999,14 @@ TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCertificateBio)(TCN_STDARGS, jlong c
         goto cleanup;
     }
 
-    if ((c->keys[idx] = load_pem_key_bio(c->cb_data, key_bio)) == NULL) {
+    if ((pkey = load_pem_key_bio(c->cb_data, key_bio)) == NULL) {
         ERR_error_string(ERR_get_error(), err);
         ERR_clear_error();
         tcn_Throw(e, "Unable to load certificate key (%s)",err);
         rv = JNI_FALSE;
         goto cleanup;
     }
-    if ((c->certs[idx] = load_pem_cert_bio(c->cb_data, cert_bio)) == NULL) {
+    if ((xcert = load_pem_cert_bio(c->cb_data, cert_bio)) == NULL) {
         ERR_error_string(ERR_get_error(), err);
         ERR_clear_error();
         tcn_Throw(e, "Unable to load certificate (%s) ", err);
@@ -1026,14 +1014,14 @@ TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCertificateBio)(TCN_STDARGS, jlong c
         goto cleanup;
     }
 
-    if (SSL_CTX_use_certificate(c->ctx, c->certs[idx]) <= 0) {
+    if (SSL_CTX_use_certificate(c->ctx, xcert) <= 0) {
         ERR_error_string(ERR_get_error(), err);
         ERR_clear_error();
         tcn_Throw(e, "Error setting certificate (%s)", err);
         rv = JNI_FALSE;
         goto cleanup;
     }
-    if (SSL_CTX_use_PrivateKey(c->ctx, c->keys[idx]) <= 0) {
+    if (SSL_CTX_use_PrivateKey(c->ctx, pkey) <= 0) {
         ERR_error_string(ERR_get_error(), err);
         ERR_clear_error();
         tcn_Throw(e, "Error setting private key (%s)", err);
@@ -1051,9 +1039,10 @@ TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCertificateBio)(TCN_STDARGS, jlong c
     }
 cleanup:
     TCN_FREE_CSTRING(password);
+    EVP_PKEY_free(pkey); // this function is safe to call with NULL
+    X509_free(xcert); // this function is safe to call with NULL
     return rv;
 }
-
 
 // Convert protos to wire format
 static int initProtocols(JNIEnv *e, unsigned char **proto_data,
@@ -1061,7 +1050,7 @@ static int initProtocols(JNIEnv *e, unsigned char **proto_data,
     int i;
     unsigned char *p_data;
     // We start with allocate 128 bytes which should be good enough for most use-cases while still be pretty low.
-    // We will call realloc to increate this if needed.
+    // We will call realloc to increase this if needed.
     size_t p_data_size = 128;
     size_t p_data_len = 0;
     jstring proto_string;
@@ -1457,17 +1446,17 @@ static const char* authentication_method(const SSL* ssl) {
 {
     const STACK_OF(SSL_CIPHER) *ciphers = NULL;
 
-    switch (ssl->version)
+    switch (SSL_version(ssl))
         {
         case SSL2_VERSION:
             return SSL_TXT_RSA;
         default:
             ciphers = SSL_get_ciphers(ssl);
-            if (ciphers == NULL || sk_num((_STACK*) ciphers) <= 0) {
+            if (ciphers == NULL || sk_SSL_CIPHER_num(ciphers) <= 0) {
                 // No cipher available so return UNKNOWN.
                 return UNKNOWN_AUTH_METHOD;
             }
-            return SSL_cipher_authentication_method(sk_value((_STACK*) ciphers, 0));
+            return SSL_cipher_authentication_method(sk_SSL_CIPHER_value(ciphers, 0));
         }
     }
 }
@@ -1478,11 +1467,10 @@ static int SSL_cert_verify(X509_STORE_CTX *ctx, void *arg) {
     SSL *ssl = X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
     tcn_ssl_ctxt_t *c = SSL_get_app_data2(ssl);
 
-
     // Get a stack of all certs in the chain
     STACK_OF(X509) *sk = ctx->untrusted;
 
-    int len = sk_num((_STACK*) sk);
+    int len = sk_X509_num(sk);
     unsigned i;
     X509 *cert;
     int length;
@@ -1493,13 +1481,14 @@ static int SSL_cert_verify(X509_STORE_CTX *ctx, void *arg) {
     const char *authMethod;
     jstring authMethodString;
     jint result;
+    jclass byteArrayClass = tcn_get_byte_array_class();
     tcn_get_java_env(&e);
 
     // Create the byte[][] array that holds all the certs
     array = (*e)->NewObjectArray(e, len, byteArrayClass, NULL);
 
     for(i = 0; i < len; i++) {
-        cert = (X509*) sk_value((_STACK*) sk, i);
+        cert = sk_X509_value(sk, i);
 
         buf = NULL;
         length = i2d_X509(cert, &buf);
@@ -1579,6 +1568,7 @@ static jobjectArray principalBytes(JNIEnv* e, const STACK_OF(X509_NAME)* names) 
     int length;
     unsigned char *buf;
     X509_NAME* principal;
+    jclass byteArrayClass = tcn_get_byte_array_class();
 
     if (names == NULL) {
         return NULL;
@@ -1619,27 +1609,29 @@ static jobjectArray principalBytes(JNIEnv* e, const STACK_OF(X509_NAME)* names) 
     return array;
 }
 
-/**
- * Partly based on code from conscrypt:
- * https://android.googlesource.com/platform/external/conscrypt/+/master/src/main/native/org_conscrypt_NativeCrypto.cpp
- */
 static int cert_requested(SSL* ssl, X509** x509Out, EVP_PKEY** pkeyOut) {
     tcn_ssl_ctxt_t *c = SSL_get_app_data2(ssl);
-    char ssl2_ctype = SSL3_CT_RSA_SIGN;
     int ctype_num;
     jbyte* ctype_bytes;
     jobjectArray issuers;
     JNIEnv *e;
     jbyteArray keyTypes;
-    X509* certificate;
-    EVP_PKEY* privatekey;
+    jobject keyMaterial;
+    STACK_OF(X509) *chain = NULL;
+    X509 *cert = NULL;
+    EVP_PKEY* pkey = NULL;
+    jlong certChain;
+    jlong privateKey;
     tcn_get_java_env(&e);
+    int certChainLen;
+    int i;
 
-    /* Clear output of key and certificate in case of early exit due to error. */
-    *x509Out = NULL;
-    *pkeyOut = NULL;
+#if defined(LIBRESSL_VERSION_NUMBER)
+    return -1;
+#else
 
-#if !defined(OPENSSL_IS_BORINGSSL) && (OPENSSL_VERSION_NUMBER < 0x1000200fL || LIBRESSL_VERSION_NUMBER < 0x20400000L)
+#if !defined(OPENSSL_IS_BORINGSSL) && OPENSSL_VERSION_NUMBER < 0x10002000L
+    char ssl2_ctype = SSL3_CT_RSA_SIGN;
     switch (ssl->version) {
         case SSL2_VERSION:
             ctype_bytes = (jbyte*) &ssl2_ctype;
@@ -1671,19 +1663,59 @@ static int cert_requested(SSL* ssl, X509** x509Out, EVP_PKEY** pkeyOut) {
     issuers = principalBytes(e,  SSL_get_client_CA_list(ssl));
 
     // Execute the java callback
-    (*e)->CallVoidMethod(e, c->cert_requested_callback, c->cert_requested_callback_method, P2J(ssl), keyTypes, issuers);
-
-    // Check for values set from Java
-    certificate = SSL_get_certificate(ssl);
-    privatekey  = SSL_get_privatekey(ssl);
-
-    if (certificate != NULL && privatekey != NULL) {
-        *x509Out = certificate;
-        *pkeyOut = privatekey;
-        return 1;
+    keyMaterial = (*e)->CallObjectMethod(e, c->cert_requested_callback, c->cert_requested_callback_method, P2J(ssl), keyTypes, issuers);
+    if (keyMaterial == NULL) {
+        return 0;
     }
+
+    // Any failure after this line must cause a goto fail to cleanup things.
+    certChain = (*e)->GetLongField(e, keyMaterial, tcn_get_key_material_certificate_chain_field());
+    privateKey = (*e)->GetLongField(e, keyMaterial, tcn_get_key_material_private_key_field());
+
+    chain = J2P(certChain, STACK_OF(X509) *);
+    pkey = J2P(privateKey, EVP_PKEY *);
+
+    if (chain == NULL || pkey == NULL) {
+        goto fail;
+    }
+
+    certChainLen = sk_X509_num(chain);
+
+    if (certChainLen <= 0) {
+       goto fail;
+    }
+
+    // Skip the first cert in the chain as we will write this to x509Out.
+    // See https://github.com/netty/netty-tcnative/issues/184
+    for (i = 1; i < certChainLen; ++i) {
+        // We need to explicit add extra certs to the chain as stated in:
+        // https://www.openssl.org/docs/manmaster/ssl/SSL_CTX_set_client_cert_cb.html
+        //
+        // Using SSL_add0_chain_cert(...) here as we not want to increment the reference count.
+        if (SSL_add0_chain_cert(ssl, sk_X509_value(chain, i)) <= 0) {
+            goto fail;
+        }
+    }
+
+    cert = sk_X509_value(chain, 0);
+    // Increment the reference count as we already set the chain via SSL_set0_chain(...) and using a cert out of it.
+    if (tcn_X509_up_ref(cert) <= 0) {
+        goto fail;
+    }
+    *x509Out = cert;
+    *pkeyOut = pkey;
+
+    // Free the stack it self but not the certs.
+    sk_X509_free(chain);
+    return 1;
+fail:
+    ERR_clear_error();
+    sk_X509_pop_free(chain, X509_free);
+    EVP_PKEY_free(pkey);
+
     // TODO: Would it be more correct to return 0 in this case we may not want to use any cert / private key ?
     return -1;
+#endif
 }
 
 TCN_IMPLEMENT_CALL(void, SSLContext, setCertRequestedCallback)(TCN_STDARGS, jlong ctx, jobject callback)
@@ -1697,7 +1729,7 @@ TCN_IMPLEMENT_CALL(void, SSLContext, setCertRequestedCallback)(TCN_STDARGS, jlon
         SSL_CTX_set_client_cert_cb(c->ctx, NULL);
     } else {
         jclass callback_class = (*e)->GetObjectClass(e, callback);
-        jmethodID method = (*e)->GetMethodID(e, callback_class, "requested", "(J[B[[B)V");
+        jmethodID method = (*e)->GetMethodID(e, callback_class, "requested", "(J[B[[B)Lorg/apache/tomcat/jni/CertificateRequestedCallback$KeyMaterial;");
         if (method == NULL) {
             return;
         }
@@ -1878,6 +1910,16 @@ TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCACertificate)(TCN_STDARGS,
     return JNI_FALSE;
 }
 
+TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCACertificateBio)(TCN_STDARGS,
+                                                           jlong ctx,
+                                                           jlong certs)
+{
+    UNREFERENCED_STDARGS;
+    UNREFERENCED(ctx);
+    UNREFERENCED(certs);
+    return JNI_FALSE;
+}
+
 TCN_IMPLEMENT_CALL(void, SSLContext, setShutdownType)(TCN_STDARGS, jlong ctx,
                                                       jint type)
 {
@@ -1905,7 +1947,7 @@ TCN_IMPLEMENT_CALL(void, SSLContext, setRandom)(TCN_STDARGS, jlong ctx,
 
 TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCertificate)(TCN_STDARGS, jlong ctx,
                                                          jstring cert, jstring key,
-                                                         jstring password, jint idx)
+                                                         jstring password)
 {
     UNREFERENCED_STDARGS;
     UNREFERENCED(ctx);
@@ -1918,7 +1960,7 @@ TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCertificate)(TCN_STDARGS, jlong ctx,
 
 TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCertificateBio)(TCN_STDARGS, jlong ctx,
                                                          jlong cert, jlong key,
-                                                         jstring password, jint idx)
+                                                         jstring password)
 {
     UNREFERENCED_STDARGS;
     UNREFERENCED(ctx);
@@ -1928,6 +1970,7 @@ TCN_IMPLEMENT_CALL(jboolean, SSLContext, setCertificateBio)(TCN_STDARGS, jlong c
     UNREFERENCED(idx);
     return JNI_FALSE;
 }
+
 TCN_IMPLEMENT_CALL(void, SSLContext, setNpnProtos)(TCN_STDARGS, jlong ctx, jobjectArray next_protos,
         jint selectorFailureBehavior)
 {
@@ -1935,7 +1978,6 @@ TCN_IMPLEMENT_CALL(void, SSLContext, setNpnProtos)(TCN_STDARGS, jlong ctx, jobje
     UNREFERENCED(ctx);
     UNREFERENCED(next_protos);
 }
-
 
 TCN_IMPLEMENT_CALL(void, SSLContext, setAlpnProtos)(TCN_STDARGS, jlong ctx, jobjectArray alpn_protos,
         jint selectorFailureBehavior)
